@@ -2,7 +2,11 @@ import TransportHid from "@ledgerhq/hw-transport-node-hid";
 import { base64 } from "@scure/base";
 import * as bip32 from "@scure/bip32";
 import * as btc from "@scure/btc-signer";
-import { AppClient, DefaultWalletPolicy, WalletPolicy } from "ledger-bitcoin";
+import { AppClient, WalletPolicy } from "ledger-bitcoin";
+
+const changeAddress = "2MvD5Ug9arybH1K4rJNDwiNaSCw9cPxfyZn";
+const ledgerAccountIdx = 0;
+const localAccountIdx = 0;
 
 function hexToBytes(hex: string) {
   let bytes = [];
@@ -10,25 +14,6 @@ function hexToBytes(hex: string) {
     bytes.push(parseInt(hex.substr(c, 2), 16));
   return Uint8Array.from(bytes);
 }
-
-const nativeSegwitDerivationPath = "m/84'/1'/0'/0/0";
-const transport = await TransportHid.default.create();
-const app = new AppClient(transport);
-
-const masterFingerPrint = await app.getMasterFingerprint();
-const extendedPublicKey = await app.getExtendedPubkey("m/84'/1'/0'");
-
-const nativeSegwitPolicy = new DefaultWalletPolicy(
-  "wpkh(@0/**)",
-  `[${masterFingerPrint}/84'/1'/0']${extendedPublicKey}`
-);
-const nativeSegwitAddress = await app.getWalletAddress(
-  nativeSegwitPolicy,
-  null,
-  0,
-  0,
-  false
-);
 
 const testnet = {
   bip32: {
@@ -38,92 +23,145 @@ const testnet = {
   wif: 0xef,
 };
 
-const { publicKey: nativeSegwitPubKey } = bip32.HDKey.fromExtendedKey(
-  extendedPublicKey,
-  testnet.bip32
-)
-  .deriveChild(0)
-  .deriveChild(0);
+const transport = await TransportHid.default.create();
+const app = new AppClient(transport);
 
-const keySeed = hexToBytes("ab".repeat(32));
-const localRootKey = bip32.HDKey.fromMasterSeed(
-  Buffer.from(keySeed),
-  testnet.bip32
-);
-const localSegwitKey = localRootKey.derive("m/84'/1'/0'");
-const localKey = localSegwitKey.deriveChild(0).deriveChild(0);
+const getLedgerStuff = async (accountIdx: 0 | 1) => {
+  const masterFingerPrint = await app.getMasterFingerprint();
+  const extendedPublicKey = await app.getExtendedPubkey("m/84'/1'/0'");
 
-const p2ms = btc.p2ms(2, [nativeSegwitPubKey!, localKey.publicKey!]);
-const p2sh = btc.p2sh(p2ms, btc.TEST_NETWORK);
+  const { publicKey: nativeSegwitPubKey } = bip32.HDKey.fromExtendedKey(
+    extendedPublicKey,
+    testnet.bip32
+  )
+    .deriveChild(0)
+    .deriveChild(accountIdx);
 
-console.log("Address 1:", p2sh.address);
+  return {
+    masterFingerPrint,
+    extendedPublicKey,
+    nativeSegwitPubKey: nativeSegwitPubKey!,
+    derivationPath: `m/84'/1'/0'/0/${accountIdx}`,
+  };
+};
 
-const multisigPolicy = new WalletPolicy(
-  "multisig",
-  "sh(multi(2,@0/**,@1/**))",
-  [
-    `[${masterFingerPrint}/84'/1'/0']${extendedPublicKey}`,
-    localSegwitKey.publicExtendedKey,
-  ]
-);
-const [_policyId, hmac] = await app.registerWallet(multisigPolicy);
-const address = await app.getWalletAddress(multisigPolicy, hmac, 0, 0, false);
-
-console.log("Address 2:", address);
-
-// get inputs
-const inputs = await fetch(
-  `https://mempool.space/testnet/api/address/${address}/utxo`
-).then((res) => res.json());
-
-if (inputs.length === 0) {
-  throw new Error(
-    `No UTXOs found for address ${address}. Please send some funds to this address and try again.`
+const getLocalStuff = async (accountIdx: 0 | 1) => {
+  const keySeed = hexToBytes("ab".repeat(32));
+  const localRootKey = bip32.HDKey.fromMasterSeed(
+    Buffer.from(keySeed),
+    testnet.bip32
   );
-}
-const inputToSpend = inputs[0];
-const inputTxnHex = await fetch(
-  `https://mempool.space/testnet/api/tx/${inputToSpend.txid}/hex`
-).then((res) => res.text());
+  const masterFingerPrint = localRootKey.fingerprint.toString(16);
+  const localSegwitKey = localRootKey.derive("m/84'/1'/0'");
+  const localKey = localSegwitKey.deriveChild(0).deriveChild(accountIdx);
 
-// build txn
-const txn = new btc.Transaction();
-txn.addInput({
-  txid: inputToSpend.txid,
-  index: inputToSpend.vout,
-  nonWitnessUtxo: Buffer.from(inputTxnHex, "hex"),
-  redeemScript: p2sh.redeemScript,
-  bip32Derivation: [
+  return {
+    masterFingerPrint,
+    extendedPublicKey: localSegwitKey.publicExtendedKey!,
+    nativeSegwitPubKey: localKey.publicKey!,
+    nativeSegwitPrivKey: localKey.privateKey!,
+    derivationPath: `m/84'/1'/0'/0/${accountIdx}`,
+  };
+};
+
+const run = async () => {
+  const ledgerStuff = await getLedgerStuff(ledgerAccountIdx);
+  const localStuff = await getLocalStuff(localAccountIdx);
+
+  // build multisig wrapped in script hash address
+  const p2ms = btc.p2ms(2, [
+    ledgerStuff.nativeSegwitPubKey,
+    localStuff.nativeSegwitPubKey,
+  ]);
+  const p2sh = btc.p2sh(p2ms, btc.TEST_NETWORK);
+
+  const address = p2sh.address;
+
+  console.log("Multisig address:", address);
+
+  // get inputs for address
+  const inputs = await fetch(
+    `https://mempool.space/testnet/api/address/${address}/utxo`
+  ).then((res) => res.json());
+
+  if (inputs.length === 0) {
+    throw new Error(
+      `No UTXOs found for address ${address}. Please send at least 2000 sats to this address and try again.`
+    );
+  }
+  const inputToSpend = inputs[0];
+
+  const inputTxnHex = await fetch(
+    `https://mempool.space/testnet/api/tx/${inputToSpend.txid}/hex`
+  ).then((res) => res.text());
+
+  // register multisig wallet
+  const multisigPolicy = new WalletPolicy(
+    "multisig",
+    "sh(multi(2,@0/**,@1/**))",
     [
-      nativeSegwitPubKey!,
-      {
-        path: btc.bip32Path(nativeSegwitDerivationPath),
-        fingerprint: parseInt(masterFingerPrint, 16),
-      },
+      `[${ledgerStuff.masterFingerPrint}/84'/1'/0']${ledgerStuff.extendedPublicKey}`,
+      `[${localStuff.masterFingerPrint}/84'/1'/0']${localStuff.extendedPublicKey}`,
+    ]
+  );
+  const [_policyId, hmac] = await app.registerWallet(multisigPolicy);
+
+  // build txn
+  const txn = new btc.Transaction();
+  txn.addInput({
+    txid: inputToSpend.txid,
+    index: inputToSpend.vout,
+    nonWitnessUtxo: Buffer.from(inputTxnHex, "hex"),
+    redeemScript: p2sh.redeemScript,
+    bip32Derivation: [
+      [
+        ledgerStuff.nativeSegwitPubKey,
+        {
+          path: btc.bip32Path(ledgerStuff.derivationPath),
+          fingerprint: parseInt(ledgerStuff.masterFingerPrint, 16),
+        },
+      ],
+      [
+        localStuff.nativeSegwitPubKey,
+        {
+          path: btc.bip32Path(localStuff.derivationPath),
+          fingerprint: parseInt(localStuff.masterFingerPrint, 16),
+        },
+      ],
     ],
-  ],
-});
-
-txn.addOutputAddress(
-  "2MvD5Ug9arybH1K4rJNDwiNaSCw9cPxfyZn",
-  BigInt(inputToSpend.value - 500),
-  btc.TEST_NETWORK
-);
-
-const signed = await app.signPsbt(
-  base64.encode(txn.toPSBT()),
-  multisigPolicy,
-  hmac
-);
-
-for (const signature of signed) {
-  txn.updateInput(signature[0], {
-    partialSig: [[signature[1].pubkey, signature[1].signature]],
   });
-}
 
-txn.finalize();
-await fetch("https://mempool.space/testnet/api/tx", {
-  method: "POST",
-  body: txn.hex,
-});
+  txn.addOutputAddress(
+    changeAddress,
+    BigInt(inputToSpend.value - 500),
+    btc.TEST_NETWORK
+  );
+
+  // ledger is first multisig signer, so sign with it first
+  const signed = await app.signPsbt(
+    base64.encode(txn.toPSBT()),
+    multisigPolicy,
+    hmac
+  );
+
+  for (const signature of signed) {
+    txn.updateInput(signature[0], {
+      partialSig: [[signature[1].pubkey, signature[1].signature]],
+    });
+  }
+
+  // sign with local key second
+  txn.signIdx(localStuff.nativeSegwitPrivKey, 0);
+
+  // finalise and broadcast
+  txn.finalize();
+
+  await fetch("https://mempool.space/testnet/api/tx", {
+    method: "POST",
+    body: txn.hex,
+  });
+
+  console.log("See txn at: https://mempool.space/testnet/tx/" + txn.id);
+};
+
+run().catch(console.error);
