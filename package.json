@@ -1,0 +1,18 @@
+{
+  "type": "module",
+  "dependencies": {
+    "@bitcoinerlab/secp256k1": "^1.0.5",
+    "@ledgerhq/hw-transport-node-hid": "^6.28.3",
+    "@scure/base": "^1.1.5",
+    "@scure/btc-signer": "^1.2.1",
+    "bip32": "^4.0.0",
+    "ledger-bitcoin": "^0.2.3",
+    "typescript": "^5.3.3"
+  },
+  "scripts": {
+    "start": "tsc && node dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.16"
+  }
+}
