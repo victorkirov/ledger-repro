@@ -1,11 +1,15 @@
-import * as ecc from "@bitcoinerlab/secp256k1";
 import TransportHid from "@ledgerhq/hw-transport-node-hid";
 import { base64 } from "@scure/base";
+import * as bip32 from "@scure/bip32";
 import * as btc from "@scure/btc-signer";
-import { BIP32Factory } from "bip32";
 import { AppClient, DefaultWalletPolicy, WalletPolicy } from "ledger-bitcoin";
 
-const bip32 = BIP32Factory(ecc);
+function hexToBytes(hex: string) {
+  let bytes = [];
+  for (let c = 0; c < hex.length; c += 2)
+    bytes.push(parseInt(hex.substr(c, 2), 16));
+  return Uint8Array.from(bytes);
+}
 
 const nativeSegwitDerivationPath = "m/84'/1'/0'/0/0";
 const transport = await TransportHid.default.create();
@@ -25,27 +29,47 @@ const nativeSegwitAddress = await app.getWalletAddress(
   0,
   false
 );
-const { publicKey: nativeSegwitPubKey } = bip32
-  .fromBase58(
-    extendedPublicKey,
-    {
-      bip32: {
-        public: 0x043587cf,
-        private: 0x04358394,
-      },
-      wif: 0xef,
-    } // testnet
-  )
-  .derivePath("0/0");
 
-const p2ms = btc.p2ms(1, [nativeSegwitPubKey]);
-const p2sh = btc.p2sh(p2ms);
+const testnet = {
+  bip32: {
+    public: 0x043587cf,
+    private: 0x04358394,
+  },
+  wif: 0xef,
+};
 
-const multisigPolicy = new WalletPolicy("multisig", "sh(multi(1,@0/**))", [
-  `[${masterFingerPrint}/84'/1'/0']${extendedPublicKey}`,
-]);
+const { publicKey: nativeSegwitPubKey } = bip32.HDKey.fromExtendedKey(
+  extendedPublicKey,
+  testnet.bip32
+)
+  .deriveChild(0)
+  .deriveChild(0);
+
+const keySeed = hexToBytes("ab".repeat(32));
+const localRootKey = bip32.HDKey.fromMasterSeed(
+  Buffer.from(keySeed),
+  testnet.bip32
+);
+const localSegwitKey = localRootKey.derive("m/84'/1'/0'");
+const localKey = localSegwitKey.deriveChild(0).deriveChild(0);
+
+const p2ms = btc.p2ms(2, [nativeSegwitPubKey!, localKey.publicKey!]);
+const p2sh = btc.p2sh(p2ms, btc.TEST_NETWORK);
+
+console.log("Address 1:", p2sh.address);
+
+const multisigPolicy = new WalletPolicy(
+  "multisig",
+  "sh(multi(2,@0/**,@1/**))",
+  [
+    `[${masterFingerPrint}/84'/1'/0']${extendedPublicKey}`,
+    localSegwitKey.publicExtendedKey,
+  ]
+);
 const [_policyId, hmac] = await app.registerWallet(multisigPolicy);
 const address = await app.getWalletAddress(multisigPolicy, hmac, 0, 0, false);
+
+console.log("Address 2:", address);
 
 // get inputs
 const inputs = await fetch(
@@ -69,13 +93,9 @@ txn.addInput({
   index: inputToSpend.vout,
   nonWitnessUtxo: Buffer.from(inputTxnHex, "hex"),
   redeemScript: p2sh.redeemScript,
-  witnessUtxo: {
-    amount: BigInt(inputToSpend.value),
-    script: p2sh.script,
-  },
   bip32Derivation: [
     [
-      nativeSegwitPubKey,
+      nativeSegwitPubKey!,
       {
         path: btc.bip32Path(nativeSegwitDerivationPath),
         fingerprint: parseInt(masterFingerPrint, 16),
